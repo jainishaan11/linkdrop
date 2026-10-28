@@ -1,13 +1,57 @@
+
 const http = require('node:http');
 const { Pool } = require('pg');
 const config = require('./config');
 
-const pool = new Pool({ connectionString: config.databaseUrl, max: 5 });
+if (!config.databaseUrl) {
+  console.error('Missing database settings: set PG_URL (or DATABASE_URL).');
+  process.exit(1);
+}
+
+const pool = new Pool({
+  connectionString: config.databaseUrl,
+  max: 5,
+  ssl: config.pgSsl ? { rejectUnauthorized: false } : undefined,
+});
+
+// Log unexpected errors from idle database connections.
+pool.on('error', (err) => {
+  console.error('Unexpected PostgreSQL pool error:', err);
+});
+
+// Create the table automatically if the database is empty.
+async function ensureSchema() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS links (
+      id bigserial PRIMARY KEY,
+      url text NOT NULL,
+      note text NOT NULL DEFAULT '',
+      created_at timestamptz NOT NULL DEFAULT now()
+    )
+  `);
+}
+
+// Escape user-provided text before inserting it into HTML.
+function esc(value) {
+  return String(value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
 
 function render(links) {
   const items = links
-    .map((l) => `<li><a href="${l.url}">${l.url}</a><p>${l.note}</p><time>${l.created_at.toISOString()}</time></li>`)
+    .map((l) => {
+      const safeUrl = esc(l.url);
+      const safeNote = esc(l.note);
+      const createdAt = esc(new Date(l.created_at).toISOString());
+
+      return `<li><a href="${safeUrl}">${safeUrl}</a><p>${safeNote}</p><time>${createdAt}</time></li>`;
+    })
     .join('\n');
+
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -39,23 +83,31 @@ ${items}
 
 async function listLinks() {
   const { rows } = await pool.query(
-    'SELECT url, note, created_at FROM links ORDER BY created_at LIMIT $1',
+    'SELECT url, note, created_at FROM links ORDER BY created_at DESC LIMIT $1',
     [config.pageSize],
   );
   return rows;
 }
 
 async function addLink(url, note) {
-  await pool.query('INSERT INTO links (url, note) VALUES ($1, $2)', [url, note]);
+  await pool.query(
+    'INSERT INTO links (url, note) VALUES ($1, $2)',
+    [url, note],
+  );
 }
 
 function readBody(req) {
   return new Promise((resolve, reject) => {
     let body = '';
+
     req.on('data', (chunk) => {
       body += chunk;
-      if (body.length > 10_000) req.destroy();
+      if (body.length > 10_000) {
+        reject(new Error('Request body too large'));
+        req.destroy();
+      }
     });
+
     req.on('end', () => resolve(new URLSearchParams(body)));
     req.on('error', reject);
   });
@@ -67,36 +119,63 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(200, { 'content-type': 'text/plain' });
       return res.end('ok');
     }
+
     if (req.method === 'GET' && req.url === '/') {
       const links = await listLinks();
       res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
       return res.end(render(links));
     }
+
     if (req.method === 'POST' && req.url === '/links') {
       const form = await readBody(req);
       const url = (form.get('url') || '').trim();
       const note = (form.get('note') || '').trim();
-      if (!url) {
+
+      let parsedUrl;
+      try {
+        parsedUrl = new URL(url);
+      } catch {
         res.writeHead(400, { 'content-type': 'text/plain' });
-        return res.end('A link needs a URL.');
+        return res.end('Please provide a valid URL.');
       }
-      await addLink(url, note);
+
+      if (!['http:', 'https:'].includes(parsedUrl.protocol)) {
+        res.writeHead(400, { 'content-type': 'text/plain' });
+        return res.end('Only HTTP and HTTPS links are allowed.');
+      }
+
+      await addLink(parsedUrl.href, note);
       res.writeHead(303, { location: '/' });
       return res.end();
     }
+
     res.writeHead(404, { 'content-type': 'text/plain' });
-    res.end('Not found');
+    return res.end('Not found');
   } catch (err) {
-    console.error(err);
-    res.writeHead(500, { 'content-type': 'text/plain' });
-    res.end('Something went wrong.');
+    console.error('Request failed:', err);
+
+    if (!res.headersSent && !res.destroyed) {
+      res.writeHead(500, { 'content-type': 'text/plain' });
+      res.end('Something went wrong.');
+    }
   }
 });
 
-server.listen(config.port, config.host, () => {
-  console.log(`linkdrop listening on http://${config.host}:${config.port}`);
-});
+ensureSchema()
+  .then(() => {
+    server.listen(config.port, config.host, () => {
+      console.log(
+        `linkdrop listening on http://${config.host}:${config.port}`,
+      );
+    });
+  })
+  .catch((err) => {
+    console.error('Could not initialize the database:', err);
+    process.exit(1);
+  });
 
 process.on('SIGTERM', () => {
-  server.close(() => pool.end().then(() => process.exit(0)));
+  server.close(() => {
+    pool.end().then(() => process.exit(0));
+  });
 });
